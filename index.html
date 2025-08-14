@@ -1,0 +1,328 @@
+<!-- Guitar Scale Learner — steel-string samples (generated → base64), pitch-shifted, natural decay
+Features: Theme selector (with PRS/dot inlays), Fret count selector (12/15/22), Scale & mode selector (full set), Root selector, Chord play, Accurate tuning & mapping
+Works fully offline. -->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Guitar Scale Learner</title>
+  <style>
+    :root{
+      --bg:#1f1f1f; --panel:#2a2a2a; --text:#fff; --muted:#aaa; --accent:#ffd166; --root:#ff6b6b;
+    }
+    body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    header{padding:14px 16px;background:#111;border-bottom:1px solid #000;display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:center}
+    header > *{margin:2px}
+    select,button,input[type="checkbox"]{background:var(--panel);color:var(--text);border:1px solid #3a3a3a;border-radius:8px;padding:6px 10px}
+    label{color:var(--muted);margin:0 6px}
+    .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center}
+    #status{font-size:13px;color:var(--muted);padding:6px 10px;text-align:center}
+    canvas{display:block;margin:14px auto 20px auto;background:#2c2c2c;border-radius:14px;box-shadow:0 6px 18px rgba(0,0,0,.35)}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <label for="themeSel">Theme</label>
+      <select id="themeSel">
+        <option>Classic Sunburst</option>
+        <option>PRS Whale Blue</option>
+        <option>Vintage Rosewood</option>
+        <option>Stage Spotlight</option>
+        <option>Minimalist Black & White</option>
+      </select>
+      <label for="prsToggle">PRS inlays</label>
+      <input type="checkbox" id="prsToggle" />
+      <label for="fretsSel">Frets</label>
+      <select id="fretsSel">
+        <option value="12">12</option>
+        <option value="15" selected>15</option>
+        <option value="22">22</option>
+      </select>
+      <label for="scaleSel">Scale/Mode</label>
+      <select id="scaleSel"></select>
+      <label for="rootSel">Root</label>
+      <select id="rootSel"></select>
+      <button id="playChordBtn">Play Chord</button>
+      <label><input type="checkbox" id="showNames" checked/> Show note names</label>
+    </div>
+  </header>
+  <div id="status">Loading steel-string samples…</div>
+  <canvas id="fretboard" width="1280" height="420"></canvas>
+
+<script>
+// ---------- Audio: generate steel-string "samples" (Karplus–Strong), encode to base64 WAV, then decode ----------
+const AudioCtx = window.AudioContext || window.webkitAudioContext; let actx;
+const SR = 44100;
+function ksPluck(durationSec, freq, brightness=0.5, damping=0.995){
+  const N = Math.floor(durationSec*SR);
+  const delay = Math.max(2, Math.floor(SR/freq));
+  const buf = new Float32Array(N);
+  // Burst of noise as excitation, slightly bright
+  for(let i=0;i<delay;i++) buf[i] = (Math.random()*2-1)*(0.6+0.4*brightness);
+  let idx = delay;
+  while(idx < N){
+    // Simple looped average with damping (KS algorithm)
+    const y = (buf[idx-delay] + buf[idx-delay+1<idx?idx-delay+1:idx-delay]) * 0.5 * damping;
+    buf[idx++] = y;
+  }
+  // Gentle attack & very light lowpass tilt for more steel-like sheen
+  let prev = 0, alpha = 0.05 + 0.15*brightness;
+  for(let i=0;i<N;i++){ const x = buf[i]; prev = prev + alpha*(x - prev); buf[i] = prev; }
+  // Short attack ramp to avoid click
+  for(let i=0;i<200;i++){ buf[i] *= i/200; }
+  return buf;
+}
+function floatTo16BitPCM(f32){
+  const b = new DataView(new ArrayBuffer(f32.length*2));
+  let offset=0; for(let i=0;i<f32.length;i++){ let s = Math.max(-1, Math.min(1, f32[i])); b.setInt16(offset, s<0?s*0x8000:s*0x7fff, true); offset+=2; }
+  return b.buffer;
+}
+function wavEncodeMono(f32, sampleRate=SR){
+  const pcm = floatTo16BitPCM(f32);
+  const buffer = new ArrayBuffer(44 + pcm.byteLength); const view = new DataView(buffer);
+  function wstr(o,s){ for(let i=0;i<s.length;i++) view.setUint8(o+i, s.charCodeAt(i)); }
+  wstr(0,'RIFF'); view.setUint32(4, 36 + pcm.byteLength, true); wstr(8,'WAVE'); wstr(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true); view.setUint32(24,sampleRate,true);
+  view.setUint32(28,sampleRate*2,true); view.setUint16(32,2,true); view.setUint16(34,16,true); wstr(36,'data'); view.setUint32(40, pcm.byteLength, true);
+  new Uint8Array(buffer,44).set(new Uint8Array(pcm));
+  return buffer;
+}
+function toBase64(ab){ const bytes = new Uint8Array(ab); let binary=''; for(let i=0;i<bytes.length;i++) binary += String.fromCharCode(bytes[i]); return btoa(binary); }
+function makeDataURLFromBuf(f32){ const wav = wavEncodeMono(f32, SR); return 'data:audio/wav;base64,' + toBase64(wav); }
+
+// E standard tuning open-string freqs - LOW E to HIGH E (bass to treble)
+const TUNING = [82.4069,110.0,146.832,196.0,246.942,329.628]; // E2 A2 D3 G3 B3 E4
+const STRING_NAMES = ['E','A','D','G','B','E']; // Low E, A, D, G, B, High E
+
+const samples = { Steel:{} };
+async function generateAndDecodeSamples(){
+  if(!actx) actx = new AudioCtx();
+  // Generate samples for each unique string type - we need low E and high E separately
+  const uniqueStrings = ['E_low', 'A', 'D', 'G', 'B', 'E_high'];
+  const frequencies = TUNING;
+  
+  for(let i=0;i<6;i++){
+    // Slightly different brightness per string (trebles brighter)
+    const brightness = i>=3 ? 0.85 : 0.65;
+    const f32 = ksPluck(3.0, frequencies[i], brightness, 0.996);
+    const url = makeDataURLFromBuf(f32);
+    const arrbuf = await fetch(url).then(r=>r.arrayBuffer());
+    samples.Steel[uniqueStrings[i]] = await actx.decodeAudioData(arrbuf);
+  }
+}
+
+function playStringNote(stringIndex, fret){
+  if(!actx) actx = new AudioCtx();
+  // Map to correct sample - distinguish between low E and high E
+  const sampleKeys = ['E_low', 'A', 'D', 'G', 'B', 'E_high'];
+  const rootBuf = samples.Steel[sampleKeys[stringIndex]]; 
+  if(!rootBuf) return;
+  
+  const src = actx.createBufferSource(); src.buffer = rootBuf;
+  const semis = Math.max(0, fret); // open=0
+  src.playbackRate.value = Math.pow(2, semis/12);
+  // light EQ for steel clarity
+  const gain = actx.createGain(); gain.gain.value = 0.9;
+  const hp = actx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=60;
+  const lp = actx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=8000;
+  src.connect(hp).connect(lp).connect(gain).connect(actx.destination);
+  src.start();
+}
+
+// ---------- Music theory helpers ----------
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+// Open string note indices - LOW E to HIGH E
+const OPEN_NOTE_INDEX = [NOTE_NAMES.indexOf('E'), NOTE_NAMES.indexOf('A'), NOTE_NAMES.indexOf('D'), NOTE_NAMES.indexOf('G'), NOTE_NAMES.indexOf('B'), NOTE_NAMES.indexOf('E')];
+function noteNameAt(stringIdx, fret){ return NOTE_NAMES[(OPEN_NOTE_INDEX[stringIdx] + fret + 12) % 12]; }
+
+// Common scales & modes (semitone offsets from root)
+const SCALE_LIBRARY = {
+  'Ionian (Major)':        [0,2,4,5,7,9,11],
+  'Dorian':                [0,2,3,5,7,9,10],
+  'Phrygian':              [0,1,3,5,7,8,10],
+  'Phrygian Dominant':     [0,1,4,5,7,8,10],
+  'Lydian':                [0,2,4,6,7,9,11],
+  'Mixolydian':            [0,2,4,5,7,9,10],
+  'Aeolian (Natural Minor)':[0,2,3,5,7,8,10],
+  'Locrian':               [0,1,3,5,6,8,10],
+  'Harmonic Minor':        [0,2,3,5,7,8,11],
+  'Melodic Minor':         [0,2,3,5,7,9,11],
+  'Major Pentatonic':      [0,2,4,7,9],
+  'Minor Pentatonic':      [0,3,5,7,10],
+  'Blues':                 [0,3,5,6,7,10],
+  'Whole Tone':            [0,2,4,6,8,10],
+  'Diminished (H-W)':      [0,1,3,4,6,7,9,10],
+  'Diminished (W-H)':      [0,2,3,5,6,8,9,11]
+};
+
+// ---------- UI state ----------
+const canvas = document.getElementById('fretboard');
+const ctx = canvas.getContext('2d');
+let totalFrets = 15;
+let theme = 'Classic Sunburst';
+let prsOverride = false;
+let currentScaleName = 'Ionian (Major)';
+let rootName = 'C';
+let showNames = true;
+
+const themes = {
+  'Classic Sunburst': { board:'#5c2f00', fret:'#d9d9d9', number:'#fff4d8', note:'#ffd166', root:'#ff6b6b', inlay:'dot' },
+  'PRS Whale Blue':   { board:'#003a57', fret:'#cfd8dc', number:'#e0fbff', note:'#2dd4f7', root:'#86ffad', inlay:'bird' },
+  'Vintage Rosewood': { board:'#3e2723', fret:'#e0d5c2', number:'#fff1d1', note:'#ffe9b3', root:'#ffb4a2', inlay:'dot' },
+  'Stage Spotlight':  { board:'#0e0e0f', fret:'#bdbdbd', number:'#efefef', note:'#d56cff', root:'#ffe066', inlay:'dot' },
+  'Minimalist Black & White': { board:'#000', fret:'#d0d0d0', number:'#fff', note:'#fff', root:'#ff5252', inlay:'dot' }
+};
+
+// ---------- Drawing ----------
+function draw(){
+  const th = themes[theme];
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle = th.board; ctx.fillRect(0,0,canvas.width,canvas.height);
+  const leftPad = 56; // string name & open area
+  const fretWidth = (canvas.width-leftPad)/totalFrets;
+  const stringGap = canvas.height/(STRING_NAMES.length+1);
+
+  // Nut
+  ctx.fillStyle = th.fret; ctx.fillRect(leftPad-3,0,3,canvas.height);
+
+  // Frets & numbers (1..N)
+  ctx.strokeStyle = th.fret; ctx.lineWidth = 2;
+  ctx.textAlign='center'; ctx.textBaseline='bottom'; ctx.font='bold 20px system-ui'; ctx.fillStyle = th.number;
+  for(let f=1; f<=totalFrets; f++){
+    const x = leftPad + f*fretWidth;
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke();
+    ctx.fillText(String(f), x - fretWidth/2, canvas.height-8);
+    // Inlays at 3,5,7,9,12(double),15,17,19,21
+    if([3,5,7,9,15,17,19,21].includes(f)) drawInlay(x - fretWidth/2, canvas.height/2, th);
+    if(f===12) { drawInlay(x - fretWidth/2, canvas.height/2 - 28, th); drawInlay(x - fretWidth/2, canvas.height/2 + 28, th); }
+  }
+
+  // Strings + labels (click label plays open) - NOW BOTTOM TO TOP (bass to treble)
+  ctx.strokeStyle = '#eee'; ctx.lineWidth = 1.5; ctx.textAlign='left'; ctx.textBaseline='middle'; ctx.font='bold 16px system-ui';
+  for(let s=0; s<6; s++){
+    // Flip the y position - string 0 (low E) goes at bottom, string 5 (high E) at top
+    const y = canvas.height - (s+1)*stringGap;
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke();
+    ctx.fillStyle = '#fff'; 
+    // Add octave indicator for the E strings to distinguish them
+    const label = STRING_NAMES[s] + (s === 0 ? '₂' : s === 5 ? '₄' : '');
+    ctx.fillText(label, 10, y);
+  }
+
+  // Scale highlights
+  const scale = SCALE_LIBRARY[currentScaleName];
+  const rootIdx = NOTE_NAMES.indexOf(rootName);
+  const scaleSet = new Set(scale.map(semi => (rootIdx + semi + 120) % 12));
+  for(let s=0;s<6;s++){
+    for(let f=1;f<=totalFrets;f++){
+      const x = leftPad + f*fretWidth - fretWidth/2;
+      // Flip y coordinate for strings
+      const y = canvas.height - (s+1)*stringGap;
+      const noteIdx = (OPEN_NOTE_INDEX[s] + f + 120) % 12;
+      const isIn = scaleSet.has(noteIdx);
+      if(isIn){
+        const isRoot = noteIdx===rootIdx;
+        drawNote(x,y, isRoot ? th.root : th.note, showNames ? NOTE_NAMES[noteIdx] : null);
+      }
+    }
+  }
+}
+
+function drawInlay(x,y, th){
+  const useBird = prsOverride ? true : (themes[theme].inlay==='bird');
+  ctx.fillStyle = '#e6e6e6';
+  if(!useBird){ ctx.beginPath(); ctx.arc(x,y,6,0,Math.PI*2); ctx.fill(); return; }
+  // Simple PRS-style bird silhouette
+  ctx.beginPath();
+  ctx.moveTo(x-10,y+4); ctx.quadraticCurveTo(x-2,y-10,x+12,y-2);
+  ctx.quadraticCurveTo(x+3,y-2,x-2,y+2); ctx.quadraticCurveTo(x+6,y+6,x+16,y+8);
+  ctx.quadraticCurveTo(x+3,y+8,x-10,y+4); ctx.closePath(); ctx.fill();
+}
+function drawNote(x,y,color,label){
+  ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x,y,12,0,Math.PI*2); ctx.fill();
+  if(label){ ctx.fillStyle = '#111'; ctx.font='bold 12px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(label, x, y); }
+}
+
+// ---------- Interaction ----------
+canvas.addEventListener('click', (e)=>{
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left; const my = e.clientY - rect.top;
+  const leftPad = 56; const fretWidth = (canvas.width-leftPad)/totalFrets; const stringGap = canvas.height/(STRING_NAMES.length+1);
+  
+  // Convert y coordinate to string index (flipped)
+  const stringFromBottom = Math.round(my/stringGap) - 1;
+  const s = 5 - stringFromBottom; // Flip: bottom string (0) becomes string 5, top string (5) becomes string 0
+  if(s<0 || s>5) return;
+  
+  if(mx < leftPad){ // open
+    playStringNote(s, 0); return;
+  }
+  let fret = Math.floor((mx - leftPad) / fretWidth) + 1; if(fret<1) fret=1; if(fret>totalFrets) fret=totalFrets;
+  playStringNote(s, fret);
+});
+
+// ---------- Controls ----------
+const themeSel = document.getElementById('themeSel');
+const prsToggle = document.getElementById('prsToggle');
+const fretsSel = document.getElementById('fretsSel');
+const scaleSel = document.getElementById('scaleSel');
+const rootSel = document.getElementById('rootSel');
+const playChordBtn = document.getElementById('playChordBtn');
+const showNamesChk = document.getElementById('showNames');
+
+// Populate scale & root
+for(const k of Object.keys(SCALE_LIBRARY)){
+  const o = document.createElement('option'); o.textContent = k; if(k===currentScaleName) o.selected=true; scaleSel.appendChild(o);
+}
+for(const n of NOTE_NAMES){ const o=document.createElement('option'); o.textContent=n; if(n===rootName) o.selected=true; rootSel.appendChild(o); }
+
+// Events
+scaleSel.onchange = ()=>{ currentScaleName = scaleSel.value; draw(); };
+rootSel.onchange = ()=>{ rootName = rootSel.value; draw(); };
+fretsSel.onchange = ()=>{ totalFrets = parseInt(fretsSel.value,10); draw(); };
+themeSel.onchange = ()=>{ theme = themeSel.value; draw(); };
+prsToggle.onchange = ()=>{ prsOverride = prsToggle.checked; draw(); };
+showNamesChk.onchange = ()=>{ showNames = showNamesChk.checked; draw(); };
+
+playChordBtn.onclick = ()=>{
+  // Basic triad from scale degrees 1-3-5
+  const degs = [0,2,4];
+  const scale = SCALE_LIBRARY[currentScaleName];
+  const rootIdx = NOTE_NAMES.indexOf(rootName);
+  const chordNotes = degs.map(d=> NOTE_NAMES[(rootIdx + (scale[d % scale.length]||0) + 120) % 12]);
+  // Strum across strings: pick closest fret within first 5 frets for each chord tone
+  const delays = [0,60,120,180,240,300];
+  for(let s=0; s<6; s++){ // low to high for a down-strum feel
+    const openIdx = OPEN_NOTE_INDEX[s];
+    // find fret within 0..5 matching any chord note
+    let chosenFret = 0; let found=false;
+    for(let f=0; f<=5 && !found; f++){
+      const idx = (openIdx + f + 120) % 12; const name = NOTE_NAMES[idx];
+      if(chordNotes.includes(name)){ chosenFret = f; found=true; }
+    }
+    setTimeout(()=> playStringNote(s, chosenFret), delays[s]);
+  }
+};
+
+// ---------- Boot ----------
+(async function boot(){
+  document.getElementById('status').textContent = 'Generating steel-string samples…';
+  await generateAndDecodeSamples();
+  document.getElementById('status').textContent = 'Ready ✓  Click strings or frets. Use the dropdowns above to change scales, root, frets & theme.';
+  draw();
+})();
+
+// ---------- Dev tests (kept & updated for new string order) ----------
+// Test: open string mapping should match reference tuning
+if(Math.abs(TUNING[0]-82.4069)>=0.1) console.error('Low E freq mismatch');
+if(!(noteNameAt(0,0)==='E' && noteNameAt(1,0)==='A' && noteNameAt(5,0)==='E')) console.error('Open string note names incorrect');
+// Test: 12th fret is octave up
+if(!(noteNameAt(0,12)==='E' && noteNameAt(4,12)==='B')) console.error('12th fret octave mapping incorrect');
+// Test: scale membership (C major contains C D E F G A B)
+(function(){
+  const set=new Set(SCALE_LIBRARY['Ionian (Major)'].map(s=>(NOTE_NAMES.indexOf('C')+s)%12));
+  ['C','D','E','F','G','A','B'].forEach(n=>{if(!set.has(NOTE_NAMES.indexOf(n))) console.error('C major missing '+n)});
+})();
+</script>
+</body>
+</html>
